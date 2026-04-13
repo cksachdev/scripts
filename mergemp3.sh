@@ -49,29 +49,6 @@ if [[ "$confirmed" != "Merge" ]]; then
   exit 0
 fi
 
-# Temp directory
-tmpdir=$(mktemp -d)
-listfile="$tmpdir/list.txt"
-> "$listfile"
-
-# Process files (ensure stereo)
-for f in "${files[@]}"; do
-  channels=$("$FFPROBE" -v error -select_streams a:0 \
-    -show_entries stream=channels \
-    -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
-
-  out="$tmpdir/$(basename "$f")"
-
-  if [[ "$channels" == "1" ]]; then
-    "$FFMPEG" -loglevel error -y -i "$f" -ac 2 -c:a libmp3lame -q:a 2 "$out"
-  else
-    cp "$f" "$out"
-  fi
-
-  esc=$(printf "%s\n" "$out" | sed "s/'/'\\\\''/g")
-  echo "file '$esc'" >> "$listfile"
-done
-
 # Get first file safely
 first_file=""
 for f in "${files[@]}"; do
@@ -92,42 +69,64 @@ end try
 ")
 
 if [[ -z "$filename" ]]; then
-  rm -rf "$tmpdir"
   exit 0
 fi
 
 output="$dir/${filename}.mp3"
-temp_output="$tmpdir/temp_merged.mp3"
 
 # Prevent overwrite
 if [[ -f "$output" ]]; then
   osascript -e 'display alert "File already exists!"'
-  rm -rf "$tmpdir"
   exit 1
 fi
 
-# Step 1: concat (no re-encode)
-"$FFMPEG" -loglevel error -y -f concat -safe 0 -i "$listfile" -c copy "$temp_output"
-concat_exit=$?
+# -------------------------------
+# 🎯 NEW SAFE MERGE APPROACH
+# -------------------------------
 
-if [[ $concat_exit -ne 0 ]]; then
-  osascript -e "display alert \"Concat failed\""
-  rm -rf "$tmpdir"
-  exit 1
-fi
+inputs=()
+filters=""
+index=0
 
-# Step 2: re-encode (your requirement)
-"$FFMPEG" -loglevel error -y -i "$temp_output" -c:a libmp3lame -b:a 192k "$output"
-final_exit=$?
+for f in "${files[@]}"; do
+  inputs+=("-i" "$f")
 
-# Cleanup
-rm -rf "$tmpdir"
+  channels=$("$FFPROBE" -v error -select_streams a:0 \
+    -show_entries stream=channels \
+    -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
+
+  if [[ "$channels" == "1" ]]; then
+    filters="${filters}[$index:a]aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0[a$index];"
+  else
+    filters="${filters}[$index:a]aformat=channel_layouts=stereo[a$index];"
+  fi
+
+  ((index++))
+done
+
+# Build concat part
+concat_inputs=""
+for ((i=0; i<index; i++)); do
+  concat_inputs="${concat_inputs}[a$i]"
+done
+
+filters="${filters}${concat_inputs}concat=n=${index}:v=0:a=1[out]"
+
+# 🚀 Merge + encode in one pass
+"$FFMPEG" -loglevel error -y \
+  "${inputs[@]}" \
+  -filter_complex "$filters" \
+  -map "[out]" \
+  -c:a libmp3lame -b:a 192k \
+  "$output"
+
+exit_code=$?
 
 # Notify
-if [[ $final_exit -eq 0 ]]; then
-  osascript -e "display notification \"MP3 merged & re-encoded (192 kbps)\" with title \"FFmpeg\""
+if [[ $exit_code -eq 0 ]]; then
+  osascript -e "display notification \"MP3 merged cleanly (192 kbps)\" with title \"FFmpeg\""
 else
-  osascript -e "display alert \"Re-encoding failed\""
+  osascript -e "display alert \"Merge failed\""
 fi
 
 exit 0
